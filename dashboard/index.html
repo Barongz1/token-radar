@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>radar-b1 — Token Launch Radar</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header class="top">
+  <div>
+    <h1>Token Launch Radar <span class="tag">radar-b1</span></h1>
+    <p class="sub">Every pre-token protocol in the 14 Nov 2026 snapshot, ranked by the expected value of a token it has not launched yet. Snapshot figures only; nothing live, nothing priced from outside.</p>
+  </div>
+  <div class="asof" id="asof"></div>
+</header>
+
+<section class="strip" id="integrity" aria-label="Integrity"></section>
+<section class="kpis" id="kpis" aria-label="Model summary"></section>
+
+<nav class="tabs" aria-label="Views">
+  <button data-tab="board" class="on">Board</button>
+  <button data-tab="live">Live tokens</button>
+  <button data-tab="model">Model &amp; validation</button>
+  <button data-tab="sandbox">Sandbox</button>
+  <button data-tab="planner">Portfolio planner</button>
+  <button data-tab="audit">Audit: all 758</button>
+</nav>
+
+<section id="tab-board" class="tab on">
+  <div class="controls">
+    <input id="q" type="search" placeholder="Search name or slug…" aria-label="Search">
+    <select id="cat" aria-label="Category"><option value="">All categories</option></select>
+    <select id="chain" aria-label="Chain"><option value="">All chains</option></select>
+    <select id="verdict" aria-label="Verdict">
+      <option value="">All verdicts</option><option>FARM</option><option>THIN</option><option>SKIP</option>
+    </select>
+    <label class="chk"><input id="watch" type="checkbox"> Watchlist only</label>
+    <label class="num">Min TVL $ <input id="mintvl" type="number" min="0" step="1000000" value="0"></label>
+    <span id="count" class="count"></span>
+  </div>
+  <table class="board">
+    <thead><tr>
+      <th data-sort="rank">#</th><th data-sort="name">Protocol</th><th data-sort="category">Category</th>
+      <th data-sort="tvl_usd">TVL</th><th data-sort="change_7d">7d</th><th data-sort="age_days">Age</th>
+      <th data-sort="launch_odds">Odds</th><th data-sort="implied_value_usd">Expected value</th>
+      <th data-sort="verdict">Verdict</th><th>Range</th>
+    </tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <p class="note" id="recompute"></p>
+</section>
+
+<section id="tab-live" class="tab">
+  <p class="note">Protocols that already trade, at their market value. They are not ranked — a token that exists cannot launch. Sorted by market cap.</p>
+  <table class="board"><thead><tr>
+    <th>Protocol</th><th>Category</th><th>TVL</th><th>Market cap</th><th>mcap / TVL</th>
+  </tr></thead><tbody id="liveRows"></tbody></table>
+</section>
+
+<section id="tab-model" class="tab">
+  <h2>How the number is made</h2>
+  <p>Expected value = curve value × launch odds. The curve is fitted on this snapshot's own traded protocols, on every run — no hardcoded names, no outside prices.</p>
+  <div id="modelText"></div>
+  <h2>Blind tests</h2>
+  <div id="validText"></div>
+  <h2>Launch odds by age</h2>
+  <div id="oddsText"></div>
+  <h2>Exclusion rule</h2>
+  <p>Ranked: every protocol the snapshot records with no token, except exchanges, versioned pools of another protocol, and wrapped / staked / bridged products of a token that already trades (Bridge, Canonical Bridge, Liquid Staking, Liquid Restaking, Restaked BTC categories; a name with a whole word wrapped, staked or staking; an exchange's name at the start). The snapshot carries no parent-protocol field, so nothing is excluded on a guess. A protocol the snapshot records with no token may still have one its DefiLlama record does not carry — the board says “no token recorded”, never “no token”.</p>
+  <p class="note">Verdict thresholds: FARM when even the low end of the 80% range clears $5M and gas stays under half the capital; THIN when the low end clears $1M; SKIP otherwise. The thresholds screen the protocol's whole expected value — they are not a promise of what one wallet earns.</p>
+</section>
+
+<section id="tab-sandbox" class="tab">
+  <h2>Model sandbox</h2>
+  <p>Move a slider and the board recomputes live, in this page, from each row's own figures. Nothing is saved.</p>
+  <div class="sliders" id="sliders"></div>
+  <p class="note" id="sandboxNote"></p>
+  <table class="board"><thead><tr><th>#</th><th>Protocol</th><th>Expected value</th><th>Odds</th></tr></thead><tbody id="sandboxRows"></tbody></table>
+</section>
+
+<section id="tab-planner" class="tab">
+  <h2>Portfolio planner</h2>
+  <p>Tick rows on the board to add them here. Totals are the sum of the picked rows' expected values, low ends, farm costs and hours.</p>
+  <div id="plannerText"></div>
+  <button id="clearPlan">Clear picks</button>
+</section>
+
+<section id="tab-audit" class="tab">
+  <h2>Audit: all 758 protocols accounted for</h2>
+  <div id="auditText"></div>
+</section>
+
+<dialog id="detail"><div id="detailBody"></div><button id="closeDetail">Close</button></dialog>
+
+<script src="../data.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
