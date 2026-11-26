@@ -3,13 +3,13 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>radar-b1 — Token Launch Radar</title>
+<title>radar-b2 — Token Launch Radar</title>
 <link rel="stylesheet" href="app.css">
 </head>
 <body>
 <header class="top">
   <div>
-    <h1>Token Launch Radar <span class="tag">radar-b1</span></h1>
+    <h1>Token Launch Radar <span class="tag">radar-b2</span></h1>
     <p class="sub">Every pre-token protocol in the 14 Nov 2026 snapshot, ranked by the expected value of a token it has not launched yet. Snapshot figures only; nothing live, nothing priced from outside.</p>
   </div>
   <div class="asof" id="asof"></div>
@@ -44,11 +44,12 @@
       <th data-sort="rank">#</th><th data-sort="name">Protocol</th><th data-sort="category">Category</th>
       <th data-sort="tvl_usd">TVL</th><th data-sort="change_7d">7d</th><th data-sort="age_days">Age</th>
       <th data-sort="launch_odds">Odds</th><th data-sort="implied_value_usd">Expected value</th>
-      <th data-sort="verdict">Verdict</th><th>Range</th>
+      <th data-sort="verdict">Verdict</th><th data-sort="net_per_hour_usd">Net $/h</th><th>Range</th>
     </tr></thead>
     <tbody id="rows"></tbody>
   </table>
   <p class="note" id="recompute"></p>
+  <p class="note">Net $/h is what one farmer earns per hour of effort on their own deposit — the row's expected value × (deposit / TVL) × 10% drop share, minus gas, over the plan's hours. It can be negative, and it is never floored at zero. The board still ranks by the protocol's whole expected value.</p>
 </section>
 
 <section id="tab-live" class="tab">
@@ -62,13 +63,15 @@
   <h2>How the number is made</h2>
   <p>Expected value = curve value × launch odds. The curve is fitted on this snapshot's own traded protocols, on every run — no hardcoded names, no outside prices.</p>
   <div id="modelText"></div>
+  <h2>Self-check — computed live from this page's own data</h2>
+  <div id="selfCheck"></div>
   <h2>Blind tests</h2>
   <div id="validText"></div>
   <h2>Launch odds by age</h2>
   <div id="oddsText"></div>
   <h2>Exclusion rule</h2>
   <p>Ranked: every protocol the snapshot records with no token, except exchanges, versioned pools of another protocol, and wrapped / staked / bridged products of a token that already trades (Bridge, Canonical Bridge, Liquid Staking, Liquid Restaking, Restaked BTC categories; a name with a whole word wrapped, staked or staking; an exchange's name at the start). The snapshot carries no parent-protocol field, so nothing is excluded on a guess. A protocol the snapshot records with no token may still have one its DefiLlama record does not carry — the board says “no token recorded”, never “no token”.</p>
-  <p class="note">Verdict thresholds: FARM when even the low end of the 80% range clears $5M and gas stays under half the capital; THIN when the low end clears $1M; SKIP otherwise. The thresholds screen the protocol's whole expected value — they are not a promise of what one wallet earns.</p>
+  <p class="note" id="verdictNote"></p>
 </section>
 
 <section id="tab-sandbox" class="tab">
@@ -76,7 +79,8 @@
   <p>Move a slider and the board recomputes live, in this page, from each row's own figures. Nothing is saved.</p>
   <div class="sliders" id="sliders"></div>
   <p class="note" id="sandboxNote"></p>
-  <table class="board"><thead><tr><th>#</th><th>Protocol</th><th>Expected value</th><th>Odds</th></tr></thead><tbody id="sandboxRows"></tbody></table>
+  <p class="note" id="dropNote"></p>
+  <table class="board"><thead><tr><th>#</th><th>Protocol</th><th>Expected value</th><th>Odds</th><th>Net $/h</th></tr></thead><tbody id="sandboxRows"></tbody></table>
 </section>
 
 <section id="tab-planner" class="tab">
