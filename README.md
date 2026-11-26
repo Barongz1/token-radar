@@ -1,70 +1,85 @@
-[![make.fun](https://make.fun/badge/token-radar-01.svg)](https://make.fun/bounty/token-radar-01)
-[![rank](https://make.fun/badge/token-radar-01/barongz1/token-radar/rank.svg)](https://make.fun/bounty/token-radar-01)
-[![reward](https://make.fun/badge/token-radar-01/barongz1/token-radar/reward.svg)](https://make.fun/bounty/token-radar-01)
+# Token Launch Radar — radar-b2
 
-# Token Launch Radar — radar-b1
+[![Token Launch Radar](https://make.fun/badge/token-radar-01.svg)](https://make.fun/bounty/token-radar-01)
+[![Rank](https://make.fun/badge/token-radar-01/barongz1/token-radar/rank.svg)](https://make.fun/bounty/token-radar-01)
+[![Reward](https://make.fun/badge/token-radar-01/barongz1/token-radar/reward.svg)](https://make.fun/bounty/token-radar-01)
 
-A ranked board of every pre-token protocol in the sealed 14 Nov 2026 snapshot, scored by the
-expected value of a token it has not launched yet. Snapshot figures only; nothing live, nothing
-priced from outside.
+Every pre-token protocol in the 14 Nov 2026 snapshot, ranked by the expected value of a
+token it has not launched yet. Snapshot figures only; nothing live, nothing priced from
+outside. Node 22, standard library only, no network. Deterministic: two runs write
+identical bytes.
 
-## The model (radar-b1)
+## What changed from radar-b1 (v1)
 
-- **Candidate set.** Every protocol the snapshot records with no token, except exchanges,
-  versioned pools of another protocol, and wrapped / staked / bridged products of a token that
-  already trades (Bridge, Canonical Bridge, Liquid Staking, Liquid Restaking, Restaked BTC
-  categories; a name with a whole word wrapped, staked or staking; an exchange's name at the
-  start). The watchlist is the floor: all 40 of its slugs are ranked, and the radar adds every
-  other rankable pre-token protocol below the floor. Live-token protocols are set aside at their
-  market value, never ranked.
-- **Curve.** Least-squares `log(mcap) = 7.7881 + 0.4721 · log(TVL)`, fitted on every run over
-  the 119 traded comps (one observation per token id), R² 0.1434. A protocol's curve value is
-  `exp(7.7881 + 0.4721 · log(TVL))`.
-- **Launch odds.** The empirical cohort rate from the snapshot itself: among dated,
-  non-exchange, non-versioned protocols, the share that already have a token, by age bucket
-  crossed with category, each cell shrunk toward its bucket's rate with a five-protocol prior.
-  Global rate 50.6% over 494 dated protocols. Brier 0.2072 vs base rate 0.2500 (leave-one-out);
-  log loss 0.6031 vs 0.6931.
-- **Expected value.** `implied_value_usd = curve value × launch odds`, whole dollars.
-- **Blind tests.** Leave-one-out median log error 1.2122 vs a flat median multiple's 1.5966
-  and per-category medians' 1.7163; time split (fit the older half by listed date, test the
-  newer) 1.0244. A quadratic curve was fitted too and lost on both tests, so the line prices
-  the board. Growth, maturity, breadth and a shrunk category effect were each put to the same
-  two blind tests; none improved both by more than 0.02, so none prices the board — the
-  ablation table on the dashboard names every term and what the tests said.
-- **Ranges.** Every row carries a p10–p90 range for its expected value and its rank, from 200
-  seeded bootstrap resamples of the comps. The farm verdict (FARM / THIN / SKIP) is netted at
-  the low end: FARM when it clears $5M and gas stays under half the capital, THIN when it
-  clears $1M, SKIP otherwise.
-- **Audit.** 198 ranked + 416 live + 144 excluded = 758. 40/40 watchlist ranked. 0 wrapped /
-  staked / bridged products ranked.
+- **Netted farm economics.** A verdict is no longer the protocol's whole value per hour.
+  A farmer captures `value × (deposit / TVL) × drop share`, minus gas, over the plan's
+  hours. Drop share is 10% for the submitted verdicts; the dashboard's sandbox slider
+  shows 5% / 10% / 20%. Net $/h can be negative and is never floored at zero.
+- **FARM bar, stated honestly.** The $10/h wage bar left 0 FARM rows, so the FARM line
+  is break-even $0/h net at the low end of the parameter band. Verdicts: **10 FARM /
+  6 THIN / 182 SKIP**. THIN means the row breaks even on its point estimate but not at
+  the low end. The counts are an outcome, not a target.
+- **Honest prediction band.** Every row now carries, beside its bootstrap parameter
+  band, a prediction band: `expected × exp(±h)`, `h = √(bootstrap_sd² + q90²)`. The
+  leave-one-out q90 is 3.4947 log (about 33×), so the band is wide — the point
+  predictions are typically wrong by 3.4×. The dashboard says so instead of hiding it.
+- **Self-check panel.** The model tab computes six checks live from data.js (watchlist
+  40/40, ranks 1..198 exactly once, implied value non-increasing, 0 wrapped ranked,
+  every farm step 20–600 chars, recompute matches).
+- **Odds calibration table.** Leave-one-out deciles of predicted rate vs actual launch
+  share, plus the full odds-challenger table.
+- **Personalised farm steps.** Two of the seven steps use the row's own figures: the
+  first action names the position size, the protocol's TVL and chain, and the nearest
+  traded comparable by size; the hold step names what a halved TVL does to the curve
+  value (about −28%).
+- **Ten-fold CV and a placebo test** for the curve, and a fourth screenshot (the Model &
+  validation tab).
 
-Top of the board: #1 Polymarket International $17,878,967 · #2 Veda $13,715,776 ·
-#3 Sentora Curator $12,935,057.
+## The model
 
-## The page
-
-`dashboard/` is a static page (no network, dark theme) with a sortable, filterable board,
-a detail view for every protocol (hash deep-link `#detail=<slug>`) showing the full model
-breakdown and a costed farm plan, a live-token tab, the integrity strip, a model-and-validation
-panel, a sandbox that recomputes the board live from sliders, and a portfolio planner. The
-page recomputes each row's expected value from its own figures in the browser and confirms
-it matches `board.json`.
+- **Curve:** `log(mcap) = 7.7881 + 0.4721 · log(TVL)`, R² 0.1434, 119 comps. LOO median
+  log error 1.2122 vs flat multiple 1.5966 and per-category medians 1.7163; time split
+  1.0244; ten-fold CV 1.1627. Placebo (shuffled y): R² 0.0006, LOO 1.357 — the fit
+  collapses, as a real fit should. Quadratic: LOO 1.2482, split 1.0073 — loses to the
+  line on both tests.
+- **Terms:** growth, maturity, breadth and category were each put to both blind tests;
+  none improved both by more than 0.02, so none is priced in. Five curve challengers
+  (Huber IRLS, winsorized y, comps TVL ≥ $50M, per-category slope, WLS by log TVL)
+  were tested the same way; none passed either. The ablation table on the dashboard
+  shows every one.
+- **Odds:** empirical cohort rate, age bucket × category, each cell shrunk toward its
+  bucket's rate with a five-protocol prior. Global rate 0.5013 over 383 dated
+  protocols. LOO Brier 0.2072 vs base rate 0.2500; log loss 0.6031 vs 0.6931; time-split
+  Brier 0.3123 vs base 0.3523. A TVL tercile was tested three ways (alone: LOO 0.2029,
+  split 0.3118; crossed with category: 0.2011 / 0.3085; hierarchical centre: 0.1919 /
+  0.3143) and rejected — the best split gain was 0.0038, within noise, and the
+  hierarchical one wins the LOO but loses the split. An early scratch run showed a
+  much larger split gain for the tercile alone (0.2487), but it traced to the
+  empty-bucket fallback using the full cohort's rate while the train half holds no
+  protocol under 365 days — the fallback, not the tercile. The logistic challenger
+  wins the split (0.2397) but loses the LOO (0.2186), so it stays out too.
+- **Board:** 198 rows. #1 Polymarket International $17,878,967 · #2 Veda $13,715,776 ·
+  #3 Sentora Curator $12,935,057 · #4 Steakhouse Financial $12,927,074 · #5 Lofty
+  $12,249,457. Audit: 198 ranked + 416 live + 144 excluded = 758/758, watchlist 40/40,
+  0 wrapped / staked / bridged products ranked.
+- **Farm economics (10% drop share):** net $/h at the low end, median −$2.48, max
+  $0.77 (#70 Manifest Trade). FARM rows: #26 marginfi Lending, #63 Lulo, #70 Manifest
+  Trade, #90 Adrastea Validator, #99 Hylo Protocol, #112 Perena Vaults, #114 Byreal,
+  #135 Tessera V, #161 GoonFi, #165 BULK.
 
 ## How to run
 
 ```sh
-mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts --input /input/snapshot.json
+mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts --input ../input/snapshot.json
 ```
 
-Node 22, standard library only. Two runs write identical bytes. The program writes
-`board.json`, `data.js` (beside the page, so the dossier's text budget stays for the page's
-own source), `dashboard/`, `screenshots/` and `dossier.json` last, via the kit's vendored
-`vendor/makefun-board.ts`.
+Reads the sealed snapshot, writes `board.json`, `data.js`, `dashboard/`,
+`screenshots/` and `dossier.json` (last, via the vendored make.fun library). Run it
+twice and diff the outputs: they must be byte-identical.
 
 ## Disclaimer
 
-Implied values are this entry's own claim, fitted from one sealed snapshot dated
-14 Nov 2026. They are a ranking signal, not a price, a promise, or investment advice. A
-protocol the snapshot records with no token may still have one its DefiLlama record does not
-carry; the board says "no token recorded", never "no token".
+Expected values are a ranking signal, not a price: the point predictions are
+typically wrong by 3.4× and the 90th-percentile error is about 33×. Net $/h is one
+farmer's share of a hypothetical drop at a stated 10% share — airdrops are never
+guaranteed, and no verdict is a promise of what one wallet earns.

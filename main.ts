@@ -1,4 +1,4 @@
-// radar-b1: a token launch radar entry (Node 22, standard library only).
+// radar-b2: a token launch radar entry (Node 22, standard library only).
 //
 // The program reads the sealed snapshot from /input/snapshot.json (or --input <file|dir>),
 // scores every pre-token protocol with the model in lib/model.ts, writes the ranked board
@@ -72,7 +72,7 @@ function copyFiles(from: string, to: string): string[] {
 const dashFiles = copyFiles(join(here, 'dashboard'), join(out, 'dashboard'));
 const shots = copyFiles(join(here, 'screenshots'), join(out, 'screenshots'));
 if (shots.length < 3 || shots.length > 4) {
-  process.stderr.write(`token radar: screenshots/ holds ${shots.length} image${shots.length === 1 ? '' : 's'}: hand in 3 or 4, the board, a detail view and a filtered view\n`);
+  process.stderr.write(`token radar: screenshots/ holds ${shots.length} image${shots.length === 1 ? '' : 's'}: hand in 3 or 4, the board, a detail view, a filtered view and the model tab\n`);
   process.exit(1);
 }
 // The dossier shows the page's source whole only while it fits the text cap; fail here,
@@ -93,9 +93,12 @@ for (const name of shots) {
 writeFileSync(join(out, 'dossier.json'), buildDossier(out, { text_max_bytes: TEXT_MAX_BYTES, screenshots: SCREENSHOT_CAPS, dashboard: { max_files: 400, max_bytes: 4_194_304 } }));
 
 const top = board.slice(0, 3).map((r) => `#${r.rank} ${r.name} $${r.implied_value_usd.toLocaleString('en-US')}`).join(', ');
+const m = radar.model;
 process.stdout.write(
-  `token radar: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored (${radar.model.audit.excluded} excluded, ${radar.model.audit.traded} live set aside)\n` +
-    `token radar: curve log(mcap) = ${radar.model.curve.intercept} + ${radar.model.curve.slope} * log(TVL), R² ${radar.model.curve.r2}, LOO ${radar.model.curve.loo_median_log_error} vs flat ${radar.model.curve.flat_loo_median_log_error}; kept terms: ${radar.model.kept_terms.length > 0 ? radar.model.kept_terms.join(', ') : 'none (curve + odds only)'}\n` +
+  `token radar: ${snapshot.protocols.length} protocols, watchlist ${m.audit.watchlist_ranked}/${m.audit.watchlist} ranked, ${board.length} rows scored (${m.audit.excluded} excluded, ${m.audit.traded} live set aside)\n` +
+    `token radar: curve log(mcap) = ${m.curve.intercept} + ${m.curve.slope} * log(TVL), R² ${m.curve.r2}, LOO ${m.curve.loo_median_log_error} vs flat ${m.curve.flat_loo_median_log_error}, split ${m.curve.split_median_log_error}, ten-fold ${m.curve.tenfold_cv_median_log_error}, placebo R² ${m.curve.placebo_r2} (LOO ${m.curve.placebo_loo_median_log_error}); kept terms: ${m.kept_terms.length > 0 ? m.kept_terms.join(', ') : 'none (curve + odds only)'}\n` +
+    `token radar: odds LOO Brier ${m.odds.loo_brier} vs base ${m.odds.base_brier}, split ${m.odds.split_brier} vs base ${m.odds.split_base_brier}, log-loss ${m.odds.loo_log_loss} vs base ${m.odds.base_log_loss}; TVL tercile ${m.odds.tercile_kept ? 'kept' : 'rejected'}; conformal q90 ${m.conformal_q90_log} log (coverage ${m.conformal_coverage})\n` +
+    `token radar: farm verdicts netted at ${m.drop_share * 100}% drop share: ${m.verdicts.farm} FARM / ${m.verdicts.thin} THIN / ${m.verdicts.skip} SKIP; FARM bar $${m.farm_threshold_usd_per_hour}/h net at the low end\n` +
     `token radar: top of the board: ${top}\n` +
     `token radar: wrote ${join(out, 'board.json')}, ${join(out, 'data.js')}, ${join(out, 'dashboard')} (${dashFiles.length} files), ${join(out, 'screenshots')} (${shots.length} images) and ${join(out, 'dossier.json')}\n`,
 );
