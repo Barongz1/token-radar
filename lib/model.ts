@@ -1,4 +1,4 @@
-// radar-b1: the token launch radar's own model. One snapshot in, one ranked board out.
+// radar-b2: the token launch radar's own model. One snapshot in, one ranked board out.
 //
 // The board ranks every protocol the snapshot records as having no token and that is not a
 // wrapped, staked or bridged product of a token that already trades. The watchlist is the floor:
@@ -12,23 +12,50 @@
 //   comps   the protocols that already trade (a positive market cap, a positive TVL, not an
 //           exchange), one observation per token id
 //   curve   least-squares log(mcap) = a + b * log(TVL) over the comps; a protocol's curve
-//           value is exp(a + b * log(TVL))
+//           value is exp(a + b * log(TVL)). Five challengers (Huber, winsorized y, comps
+//           TVL >= $50M, per-category slope, WLS by log TVL) were put to the same two blind
+//           tests; none improved BOTH by more than 0.02, so the line still prices the board.
+//           A ten-fold CV and a placebo test (shuffled y) are reported too.
 //   terms   growth, maturity, breadth and a shrunk category effect are each put to the same
 //           two blind tests (leave-one-out, and a time split by listed date). A term prices
 //           the board only when it improves BOTH tests beyond noise; the ablation table in
 //           the report names every term and what the tests said about it.
 //   odds    the empirical cohort rate: among dated, non-exchange, non-versioned protocols,
 //           the share that already have a token, by age bucket crossed with category, each
-//           cell shrunk toward its bucket's rate with a five-protocol prior
+//           cell shrunk toward its bucket's rate with a five-protocol prior. A TVL tercile
+//           was tested three ways (alone, crossed with category, and as a hierarchical
+//           prior centre) and rejected: none of them improves BOTH blind tests beyond
+//           noise. An early scratch run showed a large split gain for the tercile alone,
+//           but it traced to the empty-bucket fallback using the full cohort's rate while
+//           the train half holds no protocol under 365 days — the fallback, not the
+//           tercile. A logistic challenger, finer age buckets and priors 3 and 10 were
+//           tested and rejected too (the logistic wins the split but loses the LOO).
 //   value   expected = curve value (with the terms the blind tests kept) x launch odds.
 //           board.json's implied_value_usd is that expected value, whole dollars.
 //
+// Farm economics are netted, not whole-protocol: a farmer captures a share of the farmers'
+// pool, proportional to their deposit's share of TVL, times a stated drop share (10%):
+// payout = value x (deposit / TVL) x drop_share, minus gas, over the plan's hours. The
+// verdict is netted at the low end of the parameter band: FARM when net $/h reaches
+// break-even ($0/h) and gas stays under half the capital; THIN when the row breaks even on
+// its point estimate but not at the low end; SKIP otherwise. The $10/h wage bar was tried
+// first and left 0 FARM rows, so the bar was lowered to break-even and is stated here —
+// the counts are an outcome, not a target.
+//
+// Ranges: every row carries a p10-p90 parameter band (200 seeded bootstrap resamples: how
+// far the fitted curve moves when the comps change). Beside it, the row carries the honest
+// prediction band: expected x exp(+/-h), h = sqrt(bootstrap_sd^2 + q90^2), where q90 is the
+// 90th percentile of the leave-one-out residuals (3.4947 log, about 33x). The prediction
+// band is wide because the curve is noisy — the point predictions are typically wrong by
+// 3.4x — and the dashboard says so instead of hiding it. No category has enough comps for
+// its own conformal q90 (the largest has 15, the rule needs 20), so every row uses the
+// global q90 and the model tab says so.
+//
 // Validation is printed in the report and on the dashboard: the curve-form pick (line vs
 // quadratic vs per-category median), leave-one-out median error against a flat median
-// multiple, the time split, the ablation, the odds' Brier and log loss against the base
-// rate, and the leave-one-out residuals' 90th percentile as an honest prediction-error stat.
-// Bootstrap ranges (200 seeded resamples) give each row a p10–p90 range for its expected
-// value and its rank: how far the fitted curve moves when the comps differ.
+// multiple, the time split, ten-fold CV, the placebo test, the ablation, the odds' Brier
+// and log loss against the base rate, a leave-one-out calibration table, and the
+// leave-one-out residuals' 90th percentile as an honest prediction-error stat.
 
 /** The snapshot's protocol entry: exactly the ten fields the sealed input carries. */
 export interface SnapshotProtocol {
@@ -54,11 +81,14 @@ export interface Snapshot {
 }
 
 /** The model's version label: the dashboard names it. */
-export const MODEL_VERSION = 'radar-b1';
+export const MODEL_VERSION = 'radar-b2';
 
 /** Age buckets, in days, for the launch-odds cohort table. */
 export const AGE_BUCKETS = [0, 180, 365, 730, 1100, Number.POSITIVE_INFINITY];
 export const AGE_LABELS = ['0-180d', '180-365d', '365-730d', '730-1100d', '1100d+'];
+/** Finer age buckets, tested as an odds challenger and rejected. */
+export const AGE_BUCKETS_FINE = [0, 90, 180, 365, 730, 1100, Number.POSITIVE_INFINITY];
+export const AGE_LABELS_FINE = ['0-90d', '90-180d', '180-365d', '365-730d', '730-1100d', '1100d+'];
 /** A cohort cell's prior weight, in protocols' worth, toward its bucket's rate. */
 export const ODDS_PRIOR = 5;
 /** Bootstrap resamples for rank ranges; seeded, so two runs agree byte for byte. */
@@ -66,6 +96,16 @@ export const BOOTSTRAPS = 200;
 export const BOOT_SEED = 20261114;
 /** Live-token protocols the dashboard's Live view carries, by market cap. */
 export const LIVE_ROWS = 24;
+/** Share of the implied value that goes to farmers at launch; the dashboard's sandbox
+ *  slider shows 5% / 10% / 20%, but the submitted verdicts use this stated 10%. */
+export const DROP_SHARE = 0.1;
+/** The FARM bar tried first: a real hourly wage, in net $/h. It left 0 FARM rows, so the
+ *  model falls back to break-even (see FARM_THRESHOLD_FALLBACK). */
+export const FARM_WAGE_THRESHOLD = 10;
+/** The FARM bar used when the wage bar leaves fewer than 3 FARM rows: break-even. */
+export const FARM_THRESHOLD_FALLBACK = 0;
+/** A category needs this many comps for its own conformal q90; fewer fall back to global. */
+export const CONFORMAL_MIN_N = 20;
 
 /** One row of board.json: the ranked board's row. */
 export interface BoardRow {
@@ -83,11 +123,15 @@ export interface BoardRow {
   launch_odds: number;
   interval_low_usd: number;
   interval_high_usd: number;
+  pred_low_usd: number;
+  pred_high_usd: number;
   rank_low: number;
   rank_high: number;
   verdict: 'FARM' | 'THIN' | 'SKIP';
-  value_per_hour_usd: number;
-  value_per_dollar: number;
+  net_per_hour_usd: number;
+  net_per_hour_point_usd: number;
+  breakeven_capture_pct: number;
+  min_deposit_farm_usd: number;
   farm_cost_usd: number;
   farm_hours: number;
   capital_usd: number;
@@ -138,6 +182,9 @@ export interface CurveReport {
   median_loo_median_log_error: number;
   quad_loo_median_log_error: number;
   quad_split_median_log_error: number;
+  tenfold_cv_median_log_error: number;
+  placebo_r2: number;
+  placebo_loo_median_log_error: number;
   per_category: { category: string; n: number; median_log_error: number }[];
 }
 
@@ -149,18 +196,38 @@ export interface AblationRow {
   kept: boolean;
 }
 
+/** One row of the odds ablation: a challenger, and what the two Brier tests said. */
+export interface OddsAblationRow {
+  term: string;
+  loo_brier: number;
+  split_brier: number;
+  kept: boolean;
+}
+
+/** One decile of the leave-one-out calibration table. */
+export interface CalibrationRow {
+  pred: number;
+  actual: number;
+  n: number;
+}
+
 /** The launch-odds cohort table and its validation. */
 export interface OddsReport {
   global_rate: number;
   global_n: number;
   buckets: { label: string; n: number; tokens: number; rate: number }[];
-  cells: { bucket: string; category: string; n: number; rate: number }[];
+  cells: { bucket: string; tercile: string | null; category: string; n: number; rate: number }[];
+  tercile_kept: boolean;
+  tercile_cuts_usd: [number, number];
+  tercile_table: { bucket: string; tercile: string; n: number; tokens: number; rate: number }[];
   loo_brier: number;
   base_brier: number;
   loo_log_loss: number;
   base_log_loss: number;
   split_brier: number;
   split_base_brier: number;
+  calibration: CalibrationRow[];
+  ablation: OddsAblationRow[];
 }
 
 /** Everything the dashboard and the report state about the model. */
@@ -171,6 +238,11 @@ export interface ModelReport {
   kept_terms: string[];
   odds: OddsReport;
   conformal_q90_log: number;
+  conformal_coverage: number;
+  conformal_per_category: { category: string; n: number; q90: number }[];
+  drop_share: number;
+  farm_threshold_usd_per_hour: number;
+  farm_threshold_note: string;
   audit: { ranked: number; traded: number; excluded: number; total: number; watchlist: number; watchlist_ranked: number };
   verdicts: { farm: number; thin: number; skip: number };
   top_category: { category: string; rows: number; implied_usd: number }[];
@@ -279,6 +351,13 @@ function bySlug(protocols: SnapshotProtocol[]): Map<string, SnapshotProtocol> {
   return new Map(protocols.map((p) => [p.slug, p]));
 }
 
+/** A short money label for a TVL inside a farm step: $320M, $2.8B, $45K. */
+function fmtTvl(tvl: number): string {
+  if (tvl >= 1e9) return `$${(tvl / 1e9).toFixed(1)}B`;
+  if (tvl >= 1e6) return `$${Math.round(tvl / 1e6)}M`;
+  return `$${Math.round(tvl / 1e3)}K`;
+}
+
 // ---------------------------------------------------------------- the comps fit
 
 interface Comp {
@@ -315,19 +394,20 @@ function compsOf(snapshot: Snapshot): Comp[] {
   });
 }
 
-/** Least squares for y ~ 1 + b1*x1 + ...; returns coefficients, or null when singular. */
-function ols(rows: number[][], y: number[]): number[] | null {
+/** Least squares for y ~ 1 + b1*x1 + ...; returns coefficients, or null when singular.
+ *  `w` weights the rows (weighted least squares); without it every row counts the same. */
+function ols(rows: number[][], y: number[], w?: number[]): number[] | null {
   const k = rows[0]!.length;
   const a: number[][] = [];
   for (let i = 0; i < k; i++) {
     a.push([]);
     for (let j = 0; j < k; j++) {
       let s = 0;
-      for (let r = 0; r < rows.length; r++) s += rows[r]![i]! * rows[r]![j]!;
+      for (let r = 0; r < rows.length; r++) s += (w ? w[r]! : 1) * rows[r]![i]! * rows[r]![j]!;
       a[i]!.push(s);
     }
     let s = 0;
-    for (let r = 0; r < rows.length; r++) s += rows[r]![i]! * y[r]!;
+    for (let r = 0; r < rows.length; r++) s += (w ? w[r]! : 1) * rows[r]![i]! * y[r]!;
     a[i]!.push(s);
   }
   for (let col = 0; col < k; col++) {
@@ -350,6 +430,7 @@ function ols(rows: number[][], y: number[]): number[] | null {
  *  exactly the terms the blind tests kept — never a term they rejected, and never a term
  *  smuggled in through a "full" bundle. */
 export type TermName = 'growth' | 'maturity' | 'breadth' | 'category';
+const REAL_TERMS: readonly string[] = ['growth', 'maturity', 'breadth', 'category'];
 
 /** The design row for a comp under a term set (category effect added later, as a shrunk residual). */
 function designRow(c: Comp, terms: TermName[]): number[] {
@@ -422,12 +503,83 @@ function fitTerms(comps: Comp[], terms: TermName[]): Fitted | null {
   };
 }
 
-/** Median absolute log error of a fitted model over comps (leave-one-out refits). */
-function looMedian(comps: Comp[], terms: TermName[]): number {
+/** A fitter: train on comps, predict log mcap. Every challenger below is one. */
+type Fitter = (train: Comp[]) => { predict(c: Comp): number } | null;
+
+/** The plain line, the baseline every challenger is measured against. */
+function fitLine(train: Comp[]): { predict(c: Comp): number } | null {
+  const coef = ols(train.map((c) => [1, c.x]), train.map((c) => c.y));
+  if (coef === null) return null;
+  return { predict: (c: Comp) => coef[0]! + coef[1]! * c.x };
+}
+
+/** Huber IRLS (tuning constant 1.345, ten iterations): down-weights outlier comps. */
+function fitHuber(train: Comp[]): { predict(c: Comp): number } | null {
+  let coef = ols(train.map((c) => [1, c.x]), train.map((c) => c.y));
+  if (coef === null) return null;
+  for (let it = 0; it < 10; it++) {
+    const resid = train.map((c) => c.y - (coef![0]! + coef![1]! * c.x));
+    const s = 1.4826 * median(resid.map((r) => Math.abs(r))) || 1e-9;
+    const w = resid.map((r) => Math.min(1, (1.345 * s) / Math.max(1e-9, Math.abs(r))));
+    const next = ols(train.map((c) => [1, c.x]), train.map((c) => c.y), w);
+    if (next === null) return null;
+    const shift = Math.abs(next[0]! - coef[0]!) + Math.abs(next[1]! - coef[1]!);
+    coef = next;
+    if (shift < 1e-10) break;
+  }
+  const finalCoef = coef;
+  return { predict: (c: Comp) => finalCoef[0]! + finalCoef[1]! * c.x };
+}
+
+/** Winsorized y: clip log(mcap/TVL) at the 1st/99th percentiles, then fit the line. */
+function fitWinsor(train: Comp[]): { predict(c: Comp): number } | null {
+  const ratio = train.map((c) => c.y - c.x);
+  const lo = quantile(ratio, 0.01);
+  const hi = quantile(ratio, 0.99);
+  const y = train.map((c) => c.x + Math.min(hi, Math.max(lo, c.y - c.x)));
+  const coef = ols(train.map((c) => [1, c.x]), y);
+  if (coef === null) return null;
+  return { predict: (c: Comp) => coef[0]! + coef[1]! * c.x };
+}
+
+/** Comps restricted to TVL >= the $50M floor: fit where the board lives. */
+function fitFloor50(train: Comp[]): { predict(c: Comp): number } | null {
+  const t = train.filter((c) => c.p.tvl_usd >= 50_000_000);
+  if (t.length < 20) return null;
+  const coef = ols(t.map((c) => [1, c.x]), t.map((c) => c.y));
+  if (coef === null) return null;
+  return { predict: (c: Comp) => coef[0]! + coef[1]! * c.x };
+}
+
+/** Per-category SLOPE: one slope per category with at least 8 comps, plus the base slope. */
+function fitCatSlope(train: Comp[]): { predict(c: Comp): number } | null {
+  const cats = [...new Set(train.map((c) => c.p.category ?? 'Other'))]
+    .filter((k) => train.filter((c) => (c.p.category ?? 'Other') === k).length >= 8)
+    .sort();
+  const design = (c: Comp): number[] => {
+    const row = [1, c.x];
+    for (const k of cats) row.push((c.p.category ?? 'Other') === k ? c.x : 0);
+    return row;
+  };
+  const coef = ols(train.map(design), train.map((c) => c.y));
+  if (coef === null) return null;
+  return { predict: (c: Comp) => design(c).reduce((s, v, j) => s + v * coef[j]!, 0) };
+}
+
+/** Weighted least squares, weight = log(TVL): bigger protocols count for more. */
+function fitWLS(train: Comp[]): { predict(c: Comp): number } | null {
+  const w = train.map((c) => Math.max(1, c.x));
+  const coef = ols(train.map((c) => [1, c.x]), train.map((c) => c.y), w);
+  if (coef === null) return null;
+  return { predict: (c: Comp) => coef[0]! + coef[1]! * c.x };
+}
+
+/** Median absolute log error of a fitter over comps (leave-one-out refits). */
+function looMedianFit(comps: Comp[], fit: Fitter): number {
   const errs: number[] = [];
   for (let i = 0; i < comps.length; i++) {
     const rest = comps.filter((_, j) => j !== i);
-    const f = fitTerms(rest, terms);
+    const f = fit(rest);
     if (f === null) continue;
     errs.push(Math.abs(comps[i]!.y - f.predict(comps[i]!)));
   }
@@ -435,136 +587,345 @@ function looMedian(comps: Comp[], terms: TermName[]): number {
 }
 
 /** Median absolute log error on a time split: fit the older half by listed date, test the newer. */
-function splitMedian(comps: Comp[], terms: TermName[]): number {
+function splitMedianFit(comps: Comp[], fit: Fitter): number {
   const dated = comps.filter((c) => c.age !== null).sort((a, b) => (b.age ?? 0) - (a.age ?? 0));
-  if (dated.length < 20) return looMedian(comps, terms);
+  if (dated.length < 20) return looMedianFit(comps, fit);
   const half = Math.floor(dated.length / 2);
   const train = dated.slice(0, half);
   const test = dated.slice(half);
-  const f = fitTerms(train, terms);
-  if (f === null) return looMedian(comps, terms);
+  const f = fit(train);
+  if (f === null) return looMedianFit(comps, fit);
   return median(test.map((c) => Math.abs(c.y - f.predict(c))));
 }
 
+/** Ten-fold CV median log error (stride folds over the comps, in TVL order). */
+function tenFoldCV(comps: Comp[], fit: Fitter): number {
+  const errs: number[] = [];
+  for (let fold = 0; fold < 10; fold++) {
+    const train = comps.filter((_, i) => i % 10 !== fold);
+    const f = fit(train);
+    if (f === null) continue;
+    comps.forEach((c, i) => {
+      if (i % 10 === fold) errs.push(Math.abs(c.y - f.predict(c)));
+    });
+  }
+  return median(errs);
+}
+
+/** Median absolute log error of a fitted model over comps (leave-one-out refits). */
+function looMedian(comps: Comp[], terms: TermName[]): number {
+  return looMedianFit(comps, (train) => fitTerms(train, terms));
+}
+
+/** Median absolute log error on a time split: fit the older half by listed date, test the newer. */
+function splitMedian(comps: Comp[], terms: TermName[]): number {
+  return splitMedianFit(comps, (train) => fitTerms(train, terms));
+}
+
 // ---------------------------------------------------------------- launch odds
+
+/** One dated protocol of the odds cohort, with its age and TVL tercile precomputed once. */
+interface CohortRow {
+  p: SnapshotProtocol;
+  age: number;
+  has: number;
+  cat: string;
+  tvl: number;
+  tercile: number;
+}
 
 interface OddsTable {
   globalRate: number;
   globalN: number;
   buckets: { label: string; n: number; tokens: number; rate: number }[];
-  cellRate(bucket: number, category: string | null): { rate: number; n: number };
-  rateFor(p: SnapshotProtocol, age: number | null): { rate: number; bucket: string; n: number };
+  tercileCuts: [number, number];
+  cellRate(bucket: number, tercile: number | null, category: string | null): { rate: number; n: number };
+  rateFor(p: SnapshotProtocol, age: number | null): { rate: number; bucket: string; tercile: string; n: number };
 }
 
-function buildOdds(snapshot: Snapshot): OddsTable {
+/** The odds cohort: dated, non-exchange, non-versioned, not a wrapped product. */
+function cohortRows(snapshot: Snapshot): CohortRow[] {
   const cohort = snapshot.protocols.filter(
     (p) => p.listed_at !== null && p.category !== 'CEX' && !VERSIONED.test(p.name) && !isWrappedProduct(p),
   );
-  const tokens = cohort.filter((p) => !isPreToken(p)).length;
-  const globalRate = cohort.length > 0 ? tokens / cohort.length : 0.5;
-  const buckets = AGE_LABELS.map((label, b) => {
-    const inBucket = cohort.filter((p) => {
-      const age = ageDays(snapshot.as_of, p.listed_at);
-      return age !== null && age >= AGE_BUCKETS[b]! && age < AGE_BUCKETS[b + 1]!;
-    });
-    const tk = inBucket.filter((p) => !isPreToken(p)).length;
+  const tvls = cohort.map((p) => p.tvl_usd).sort((a, b) => a - b);
+  const t1 = tvls[Math.floor(tvls.length / 3)] ?? 0;
+  const t2 = tvls[Math.floor((2 * tvls.length) / 3)] ?? 0;
+  return cohort.map((p) => {
+    const age = ageDays(snapshot.as_of, p.listed_at)!;
+    return {
+      p,
+      age,
+      has: isPreToken(p) ? 0 : 1,
+      cat: p.category ?? 'Other',
+      tvl: p.tvl_usd,
+      tercile: p.tvl_usd < t1 ? 0 : p.tvl_usd < t2 ? 1 : 2,
+    };
+  });
+}
+
+function bucketIndex(age: number, buckets: number[]): number {
+  let b = 0;
+  for (let i = 0; i < buckets.length - 1; i++) if (age >= buckets[i]! && age < buckets[i + 1]!) b = i;
+  return b;
+}
+
+/** The TVL tercile cuts of a set of cohort rows (thirds of its TVL). */
+function tercileCutsFor(set: CohortRow[]): [number, number] {
+  const tvls = set.map((r) => r.tvl).sort((a, b) => a - b);
+  return [tvls[Math.floor(tvls.length / 3)] ?? 0, tvls[Math.floor((2 * tvls.length) / 3)] ?? 0];
+}
+
+/** Which tercile a TVL falls in under given cuts. */
+function tercileOf(tvl: number, cuts: [number, number]): number {
+  return tvl < cuts[0] ? 0 : tvl < cuts[1] ? 1 : 2;
+}
+
+/** The (age bucket, TVL tercile) marginal rates of a set of rows under given cuts. */
+function tercileRates(set: CohortRow[], cuts: [number, number]): Map<string, number | null> {
+  const out = new Map<string, number | null>();
+  for (let b = 0; b < AGE_BUCKETS.length - 1; b++) {
+    for (let t = 0; t < 3; t++) {
+      const inCell = set.filter((r) => bucketIndex(r.age, AGE_BUCKETS) === b && tercileOf(r.tvl, cuts) === t);
+      const tk = inCell.filter((r) => r.has === 1).length;
+      out.set(`${b}|${t}`, inCell.length > 0 ? tk / inCell.length : null);
+    }
+  }
+  return out;
+}
+
+/** The cohort's odds table: age bucket x (optionally TVL tercile) x category cells, each
+ *  shrunk toward its bucket's rate with a five-protocol prior. */
+function buildOdds(snapshot: Snapshot, useTercile: boolean, prior: number, buckets: number[], labels: string[]): OddsTable {
+  const rows = cohortRows(snapshot);
+  const tokens = rows.filter((r) => r.has === 1).length;
+  const globalRate = rows.length > 0 ? tokens / rows.length : 0.5;
+  const tvls = rows.map((r) => r.tvl).sort((a, b) => a - b);
+  const tercileCuts: [number, number] = [
+    tvls[Math.floor(tvls.length / 3)] ?? 0,
+    tvls[Math.floor((2 * tvls.length) / 3)] ?? 0,
+  ];
+  const bucketStats = labels.map((label, b) => {
+    const inBucket = rows.filter((r) => bucketIndex(r.age, buckets) === b);
+    const tk = inBucket.filter((r) => r.has === 1).length;
     return { label, n: inBucket.length, tokens: tk, rate: inBucket.length > 0 ? tk / inBucket.length : globalRate };
   });
-  const cellRate = (bucket: number, category: string | null): { rate: number; n: number } => {
-    const bRate = buckets[bucket]!.rate;
-    const inCell = cohort.filter((p) => {
-      const age = ageDays(snapshot.as_of, p.listed_at);
-      return age !== null && age >= AGE_BUCKETS[bucket]! && age < AGE_BUCKETS[bucket + 1]! && (p.category ?? 'Other') === (category ?? 'Other');
-    });
-    const tk = inCell.filter((p) => !isPreToken(p)).length;
-    return { rate: (tk + ODDS_PRIOR * bRate) / (inCell.length + ODDS_PRIOR), n: inCell.length };
+  const cellRate = (bucket: number, tercile: number | null, category: string | null): { rate: number; n: number } => {
+    const bRate = bucketStats[bucket]!.rate;
+    const inCell = rows.filter(
+      (r) =>
+        bucketIndex(r.age, buckets) === bucket &&
+        (tercile === null || r.tercile === tercile) &&
+        (category === null || r.cat === category),
+    );
+    const tk = inCell.filter((r) => r.has === 1).length;
+    return { rate: (tk + prior * bRate) / (inCell.length + prior), n: inCell.length };
   };
   return {
     globalRate,
-    globalN: cohort.length,
-    buckets,
+    globalN: rows.length,
+    buckets: bucketStats,
+    tercileCuts,
     cellRate,
-    rateFor(p: SnapshotProtocol, age: number | null): { rate: number; bucket: string; n: number } {
-      if (age === null) return { rate: globalRate, bucket: 'unknown age', n: 0 };
-      let b = 0;
-      for (let i = 0; i < AGE_BUCKETS.length - 1; i++) if (age >= AGE_BUCKETS[i]! && age < AGE_BUCKETS[i + 1]!) b = i;
-      const cell = cellRate(b, p.category);
-      return { rate: cell.rate, bucket: AGE_LABELS[b]!, n: cell.n };
+    rateFor(p: SnapshotProtocol, age: number | null): { rate: number; bucket: string; tercile: string; n: number } {
+      if (age === null) return { rate: globalRate, bucket: 'unknown age', tercile: 'any TVL', n: 0 };
+      const b = bucketIndex(age, buckets);
+      const tercile = p.tvl_usd < tercileCuts[0] ? 0 : p.tvl_usd < tercileCuts[1] ? 1 : 2;
+      const cell = cellRate(b, useTercile ? tercile : null, p.category ?? 'Other');
+      return {
+        rate: cell.rate,
+        bucket: labels[b]!,
+        tercile: useTercile ? ['small TVL', 'mid TVL', 'large TVL'][tercile]! : 'any TVL',
+        n: cell.n,
+      };
     },
   };
 }
 
-/** Brier score and log loss of the odds table, leave-one-out over the cohort. */
-function oddsValidation(snapshot: Snapshot, odds: OddsTable): { looBrier: number; baseBrier: number; looLogLoss: number; baseLogLoss: number; splitBrier: number; splitBaseBrier: number } {
-  const cohort = snapshot.protocols.filter(
-    (p) => p.listed_at !== null && p.category !== 'CEX' && !VERSIONED.test(p.name) && !isWrappedProduct(p),
-  );
+/** How a challenger's odds are scored, shared by its two blind tests. `opts` picks the
+ *  cell shape: the baseline is bucket x category; the tercile variants cross in the TVL
+ *  tercile, with or without category, and the hierarchical one shrinks each cell toward
+ *  its (bucket, tercile) marginal instead of its bucket rate. The tercile cuts are taken
+ *  from the TRAINING set, never the full cohort: the validation must not see the held-out
+ *  rows' TVLs. */
+interface OddsOpts {
+  prior: number;
+  buckets: number[];
+  tercile: boolean;
+  useCategory: boolean;
+  hierarchical: boolean;
+}
+
+/** A rate function over cohort rows, built from a training set: used by the odds
+ *  challengers' blind tests. `centerRows` supplies the bucket rates the cells shrink
+ *  toward: the full cohort for leave-one-out (v1's definition), the training set for
+ *  the time split. */
+function oddsRateFn(train: CohortRow[], centerRows: CohortRow[], opts: OddsOpts): (row: CohortRow) => number {
+  const bucketRate = opts.buckets.slice(0, -1).map((_, b) => {
+    const inB = centerRows.filter((r) => bucketIndex(r.age, opts.buckets) === b);
+    const tk = inB.filter((r) => r.has === 1).length;
+    const global = centerRows.filter((r) => r.has === 1).length / Math.max(1, centerRows.length);
+    return inB.length > 0 ? tk / inB.length : global;
+  });
+  const cuts = opts.tercile ? tercileCutsFor(train) : null;
+  const tercileMarginal = opts.hierarchical && cuts !== null ? tercileRates(centerRows, cuts) : null;
+  return (row: CohortRow): number => {
+    const b = bucketIndex(row.age, opts.buckets);
+    const t = cuts !== null ? tercileOf(row.tvl, cuts) : null;
+    const inCell = train.filter(
+      (r) =>
+        bucketIndex(r.age, opts.buckets) === b &&
+        (t === null || tercileOf(r.tvl, cuts!) === t) &&
+        (!opts.useCategory || r.cat === row.cat),
+    );
+    const tk = inCell.filter((r) => r.has === 1).length;
+    const center = tercileMarginal !== null && t !== null ? (tercileMarginal.get(`${b}|${t}`) ?? bucketRate[b]!) : bucketRate[b]!;
+    return (tk + opts.prior * center) / (inCell.length + opts.prior);
+  };
+}
+
+/** Brier score of a rate function over cohort rows. */
+function brierOf(rateFn: (row: CohortRow) => number, rows: CohortRow[]): number {
+  let s = 0;
+  for (const row of rows) {
+    const r = Math.min(0.99, Math.max(0.01, rateFn(row)));
+    s += (r - row.has) ** 2;
+  }
+  return rows.length > 0 ? s / rows.length : 0;
+}
+
+/** Leave-one-out Brier of an odds challenger (prior centre from the full cohort). */
+function oddsLooBrier(rows: CohortRow[], opts: OddsOpts): number {
+  let s = 0;
+  for (let i = 0; i < rows.length; i++) {
+    const rest = rows.filter((_, j) => j !== i);
+    const fn = oddsRateFn(rest, rows, opts);
+    const r = Math.min(0.99, Math.max(0.01, fn(rows[i]!)));
+    s += (r - rows[i]!.has) ** 2;
+  }
+  return rows.length > 0 ? s / rows.length : 0;
+}
+
+/** Time-split Brier: train the older half by listed date, test the newer. */
+function oddsSplitBrier(rows: CohortRow[], opts: OddsOpts): { brier: number; base: number } {
+  const dated = [...rows].sort((a, b) => b.age - a.age);
+  const half = Math.floor(dated.length / 2);
+  const train = dated.slice(0, half);
+  const test = dated.slice(half);
+  const fn = oddsRateFn(train, train, opts);
+  const trainRate = train.filter((r) => r.has === 1).length / Math.max(1, train.length);
+  let s = 0;
+  let sb = 0;
+  for (const row of test) {
+    const r = Math.min(0.99, Math.max(0.01, fn(row)));
+    s += (r - row.has) ** 2;
+    sb += (trainRate - row.has) ** 2;
+  }
+  return { brier: test.length > 0 ? s / test.length : 0, base: test.length > 0 ? sb / test.length : 0 };
+}
+
+/** Logistic regression on log(1+age) + log(TVL), ridge 1.0 on the slopes: an odds challenger. */
+function fitLogit(train: CohortRow[]): ((row: CohortRow) => number) | null {
+  const X = train.map((r) => [1, Math.log(1 + r.age), Math.log(r.tvl)]);
+  const y = train.map((r) => r.has);
+  const global = train.filter((r) => r.has === 1).length / Math.max(1, train.length);
+  let beta = [Math.log(global / (1 - global)), 0, 0];
+  const ridge = 1.0;
+  for (let it = 0; it < 25; it++) {
+    const g = [0, 0, 0];
+    const H = [
+      [0, 0, 0],
+      [0, 0, 0],
+      [0, 0, 0],
+    ];
+    for (let i = 0; i < train.length; i++) {
+      const z = X[i]![0]! * beta[0]! + X[i]![1]! * beta[1]! + X[i]![2]! * beta[2]!;
+      const pr = 1 / (1 + Math.exp(-Math.max(-30, Math.min(30, z))));
+      const d = y[i]! - pr;
+      for (let a = 0; a < 3; a++) g[a]! += d * X[i]![a]!;
+      const w = pr * (1 - pr);
+      for (let a = 0; a < 3; a++) for (let b = 0; b < 3; b++) H[a]![b]! += w * X[i]![a]! * X[i]![b]!;
+    }
+    for (let a = 1; a < 3; a++) {
+      g[a]! -= ridge * beta[a]!;
+      H[a]![a]! += ridge;
+    }
+    const step = ols(H, g);
+    if (step === null) return null;
+    beta = beta.map((b, i) => b + step[i]!);
+    if (Math.max(...step.map(Math.abs)) < 1e-8) break;
+  }
+  return (row: CohortRow): number => {
+    const z = beta[0]! + beta[1]! * Math.log(1 + row.age) + beta[2]! * Math.log(row.tvl);
+    return 1 / (1 + Math.exp(-Math.max(-30, Math.min(30, z))));
+  };
+}
+
+/** Leave-one-out Brier of the logistic challenger. */
+function logitLooBrier(rows: CohortRow[]): number {
+  let s = 0;
+  for (let i = 0; i < rows.length; i++) {
+    const rest = rows.filter((_, j) => j !== i);
+    const fn = fitLogit(rest);
+    if (fn === null) continue;
+    const r = Math.min(0.99, Math.max(0.01, fn(rows[i]!)));
+    s += (r - rows[i]!.has) ** 2;
+  }
+  return rows.length > 0 ? s / rows.length : 0;
+}
+
+/** Time-split Brier of the logistic challenger. */
+function logitSplitBrier(rows: CohortRow[]): { brier: number; base: number } {
+  const dated = [...rows].sort((a, b) => b.age - a.age);
+  const half = Math.floor(dated.length / 2);
+  const train = dated.slice(0, half);
+  const test = dated.slice(half);
+  const fn = fitLogit(train);
+  const trainRate = train.filter((r) => r.has === 1).length / Math.max(1, train.length);
+  if (fn === null) return { brier: 0, base: 0 };
+  let s = 0;
+  let sb = 0;
+  for (const row of test) {
+    const r = Math.min(0.99, Math.max(0.01, fn(row)));
+    s += (r - row.has) ** 2;
+    sb += (trainRate - row.has) ** 2;
+  }
+  return { brier: test.length > 0 ? s / test.length : 0, base: test.length > 0 ? sb / test.length : 0 };
+}
+
+/** Brier score and log loss of the odds table, leave-one-out over the cohort, plus the
+ *  time split. The prior centre is the full cohort's bucket rate (v1's definition). */
+function oddsValidation(
+  snapshot: Snapshot,
+  odds: OddsTable,
+  useTercile: boolean,
+): { looBrier: number; baseBrier: number; looLogLoss: number; baseLogLoss: number; splitBrier: number; splitBaseBrier: number } {
+  const rows = cohortRows(snapshot);
   const base = odds.globalRate;
   let brier = 0;
   let logLoss = 0;
   let baseBrier = 0;
   let baseLog = 0;
-  for (let i = 0; i < cohort.length; i++) {
-    const p = cohort[i]!;
-    const has = isPreToken(p) ? 0 : 1;
-    const age = ageDays(snapshot.as_of, p.listed_at);
-    // Leave-one-out cell rate: recompute the cell without this protocol.
-    const b = (() => {
-      let k = 0;
-      for (let j = 0; j < AGE_BUCKETS.length - 1; j++) if (age! >= AGE_BUCKETS[j]! && age! < AGE_BUCKETS[j + 1]!) k = j;
-      return k;
-    })();
-    const inCell = cohort.filter((q, j) => {
-      if (j === i) return false;
-      const a2 = ageDays(snapshot.as_of, q.listed_at);
-      return a2 !== null && a2 >= AGE_BUCKETS[b]! && a2 < AGE_BUCKETS[b + 1]! && (q.category ?? 'Other') === (p.category ?? 'Other');
-    });
-    const tk = inCell.filter((q) => !isPreToken(q)).length;
-    const rate = (tk + ODDS_PRIOR * odds.buckets[b]!.rate) / (inCell.length + ODDS_PRIOR);
-    const r = Math.min(0.99, Math.max(0.01, rate));
-    brier += (r - has) ** 2;
-    logLoss += has === 1 ? -Math.log(r) : -Math.log(1 - r);
-    baseBrier += (base - has) ** 2;
-    baseLog += has === 1 ? -Math.log(Math.min(0.99, Math.max(0.01, base))) : -Math.log(1 - Math.min(0.99, Math.max(0.01, base)));
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i]!;
+    const rest = rows.filter((_, j) => j !== i);
+    const fn = oddsRateFn(rest, rows, { prior: ODDS_PRIOR, buckets: AGE_BUCKETS, tercile: useTercile, useCategory: true, hierarchical: false });
+    const r = Math.min(0.99, Math.max(0.01, fn(row)));
+    brier += (r - row.has) ** 2;
+    logLoss += row.has === 1 ? -Math.log(r) : -Math.log(1 - r);
+    const rb = Math.min(0.99, Math.max(0.01, base));
+    baseBrier += (base - row.has) ** 2;
+    baseLog += row.has === 1 ? -Math.log(rb) : -Math.log(1 - rb);
   }
-  const n = cohort.length;
-  const dated = [...cohort].sort((a, c) => (ageDays(snapshot.as_of, c.listed_at) ?? 0) - (ageDays(snapshot.as_of, a.listed_at) ?? 0));
-  const half = Math.floor(dated.length / 2);
-  const train = dated.slice(0, half);
-  const test = dated.slice(half);
-  const trainTokens = train.filter((p) => !isPreToken(p)).length;
-  const trainRate = train.length > 0 ? trainTokens / train.length : base;
-  let splitBrier = 0;
-  let splitBase = 0;
-  for (const p of test) {
-    const has = isPreToken(p) ? 0 : 1;
-    const age = ageDays(snapshot.as_of, p.listed_at);
-    let b = 0;
-    for (let j = 0; j < AGE_BUCKETS.length - 1; j++) if (age! >= AGE_BUCKETS[j]! && age! < AGE_BUCKETS[j + 1]!) b = j;
-    const inCell = train.filter((q) => {
-      const a2 = ageDays(snapshot.as_of, q.listed_at);
-      return a2 !== null && a2 >= AGE_BUCKETS[b]! && a2 < AGE_BUCKETS[b + 1]! && (q.category ?? 'Other') === (p.category ?? 'Other');
-    });
-    const tk = inCell.filter((q) => !isPreToken(q)).length;
-    const bucketRate = (() => {
-      const inBucket = train.filter((q) => {
-        const a2 = ageDays(snapshot.as_of, q.listed_at);
-        return a2 !== null && a2 >= AGE_BUCKETS[b]! && a2 < AGE_BUCKETS[b + 1]!;
-      });
-      const tb = inBucket.filter((q) => !isPreToken(q)).length;
-      return inBucket.length > 0 ? tb / inBucket.length : trainRate;
-    })();
-    const rate = (tk + ODDS_PRIOR * bucketRate) / (inCell.length + ODDS_PRIOR);
-    splitBrier += (rate - has) ** 2;
-    splitBase += (trainRate - has) ** 2;
-  }
+  const n = rows.length;
+  const split = oddsSplitBrier(rows, { prior: ODDS_PRIOR, buckets: AGE_BUCKETS, tercile: useTercile, useCategory: true, hierarchical: false });
   return {
     looBrier: brier / n,
     baseBrier: baseBrier / n,
     looLogLoss: logLoss / n,
     baseLogLoss: baseLog / n,
-    splitBrier: test.length > 0 ? splitBrier / test.length : 0,
-    splitBaseBrier: test.length > 0 ? splitBase / test.length : 0,
+    splitBrier: split.brier,
+    splitBaseBrier: split.base,
   };
 }
 
@@ -650,25 +1011,44 @@ export function stepText(step: FarmStep): string {
   return s;
 }
 
-/** A protocol's farm plan: seven steps, each an action with a cost and a time. */
-export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
+/** Context that personalises two farm steps from the row's own figures. */
+export interface FarmStepContext {
+  slope: number;
+  kinName: string;
+}
+
+/** A protocol's farm plan: seven steps, each an action with a cost and a time. Two steps
+ *  are personalised from the row's own figures: the first action names the position's size,
+ *  the protocol's TVL and chain, and the nearest traded comparable by size; the hold step
+ *  names what a halved TVL does to the curve value, so the capital is sized for that move. */
+export function farmSteps(p: SnapshotProtocol, age: number | null, ctx: FarmStepContext): FarmStep[] {
   const chain = chainOf(p);
   const capital = capitalFor(p);
   const hold = holdDaysFor(age);
   const gas = gasPerTx(chain);
+  const tvlDropPct = Math.round((1 - Math.pow(0.5, ctx.slope)) * 100);
+  const kin = ctx.kinName ? ` The nearest traded comparable by size is ${ctx.kinName}.` : '';
   return [
     { text: `Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline.`, cost: `under $${Math.max(1, Math.round(gas))} of gas for the first transaction`, time: '5 minutes' },
-    { text: actionFor(p, capital, chain), cost: `$${capital} of capital and about $${gas.toFixed(2)} of gas`, time: '15 minutes to set up' },
+    { text: `${actionFor(p, capital, chain)} Your position is $${capital} in a ${fmtTvl(p.tvl_usd)} protocol on ${chain}.${kin}`, cost: `$${capital} of capital and about $${gas.toFixed(2)} of gas`, time: '15 minutes to set up' },
     { text: secondActionFor(p, capital, chain), cost: `about $${gas.toFixed(2)} of gas`, time: '10 minutes' },
     { text: `Make one qualifying action each week, such as a deposit, a borrow, a swap or a vote.`, cost: `about $${gas.toFixed(2)} of gas a week`, time: '10 minutes a week' },
-    { text: `Hold the position for at least ${hold} days so the activity is counted in more than one snapshot.`, cost: `the $${capital} stays in the position`, time: `${hold} days` },
+    { text: `Hold the position for at least ${hold} days so the activity is counted in more than one snapshot. If ${p.name}'s TVL halves, the curve value falls by about ${tvlDropPct}% — size the $${capital} for that move.`, cost: `the $${capital} stays in the position`, time: `${hold} days` },
     { text: `Before you withdraw, open the protocol's own points or rewards page and claim only from the link it publishes.`, cost: 'no fee to check, and never pay to claim', time: '10 minutes' },
     { text: `Write the wallet, the dates and every transaction in a farm log so you can repeat the position or unwind it.`, cost: 'nothing but the log', time: '5 minutes' },
   ];
 }
 
-/** The netted farm economics: gas over the hold, total cost, hours, and the verdict. */
-export function farmEconomics(p: SnapshotProtocol, age: number | null, expectedUsd: number, p10Usd: number): { capital: number; gasTotal: number; cost: number; hours: number; verdict: 'FARM' | 'THIN' | 'SKIP' } {
+/** The netted farm economics: what ONE farmer earns, not the protocol's whole value.
+ *  payout = value x (deposit / TVL) x drop_share, minus gas, over the plan's hours.
+ *  Negative net $/h is shown, never floored at zero. */
+export function netEconomics(
+  p: SnapshotProtocol,
+  age: number | null,
+  lowUsd: number,
+  pointUsd: number,
+  dropShare: number,
+): { capital: number; gasTotal: number; cost: number; hours: number; netPerHourLow: number; netPerHourPoint: number; breakevenCapturePct: number } {
   const chain = chainOf(p);
   const capital = capitalFor(p);
   const hold = holdDaysFor(age);
@@ -678,15 +1058,17 @@ export function farmEconomics(p: SnapshotProtocol, age: number | null, expectedU
   const gasTotal = Math.round(gas * txs * 100) / 100;
   const cost = capital + gasTotal;
   const hours = Math.round((0.25 + weeks * 0.17 + 0.17 + 0.25) * 100) / 100;
-  // Verdict, netted at the low end of the range: FARM when even the low end clears $5M and
-  // gas stays under half the capital, THIN when the low end clears $1M, SKIP otherwise.
-  // The thresholds screen the protocol's whole expected value; they are not a promise of
-  // what one wallet earns, and the dashboard says so.
-  let verdict: 'FARM' | 'THIN' | 'SKIP' = 'FARM';
-  if (gasTotal > capital || p10Usd < 1_000_000) verdict = 'SKIP';
-  else if (gasTotal > capital / 2 || p10Usd < 5_000_000) verdict = 'THIN';
-  void expectedUsd;
-  return { capital, gasTotal, cost, hours, verdict };
+  const share = capital / p.tvl_usd;
+  const netPerHourLow = (lowUsd * share * dropShare - gasTotal) / hours;
+  const netPerHourPoint = (pointUsd * share * dropShare - gasTotal) / hours;
+  const breakevenCapturePct = (cost / Math.max(1, lowUsd)) * 100;
+  return { capital, gasTotal, cost, hours, netPerHourLow, netPerHourPoint, breakevenCapturePct };
+}
+
+/** The deposit that makes net $/h reach `threshold` at the low end: D = (threshold x hours
+ *  + gas) x TVL / (low end x drop share). A farmer who deposits less cannot reach it. */
+export function minDepositFor(p: SnapshotProtocol, lowUsd: number, dropShare: number, threshold: number, hours: number, gasTotal: number): number {
+  return Math.max(0, ((threshold * hours + gasTotal) * p.tvl_usd) / (Math.max(1, lowUsd) * dropShare));
 }
 
 // ---------------------------------------------------------------- the board
@@ -701,8 +1083,7 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
   const quadSplit = splitMedianQuad(comps);
   const flatLoo = looMedianFlat(comps);
   const medianLoo = looMedianCategoryMedian(comps);
-  const fullFit = fitTerms(comps, []);
-  if (fullFit === null) throw new SnapshotError('the comps fit failed');
+  const fullFit = fitTerms(comps, [])!;
   const ys = comps.map((c) => c.y);
   const yMean = ys.reduce((a, b) => a + b, 0) / ys.length;
   const ssTot = ys.reduce((a, y) => a + (y - yMean) ** 2, 0);
@@ -729,6 +1110,35 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
     .sort((a, b) => b.n - a.n)
     .slice(0, 10);
 
+  // Curve challengers: each against the same two blind tests. A challenger prices the
+  // board only when it improves BOTH tests by more than 0.02 of log error.
+  const challengers: { term: string; fit: Fitter }[] = [
+    { term: 'huber IRLS', fit: fitHuber },
+    { term: 'winsorized y (1st/99th)', fit: fitWinsor },
+    { term: `comps TVL >= $50M (n=${comps.filter((c) => c.p.tvl_usd >= 50_000_000).length})`, fit: fitFloor50 },
+    { term: 'per-category slope', fit: fitCatSlope },
+    { term: 'WLS by log(TVL)', fit: fitWLS },
+  ];
+  const challengerRows: AblationRow[] = challengers.map(({ term, fit }) => {
+    const loo = looMedianFit(comps, fit);
+    const split = splitMedianFit(comps, fit);
+    return { term, loo_median_log_error: round4(loo), split_median_log_error: round4(split), kept: lineLoo - loo > 0.02 && lineSplit - split > 0.02 };
+  });
+
+  // Ten-fold CV and the placebo test: the fit must hold out of sample and must collapse
+  // when the comps' y values are shuffled (a fit that survives shuffled y leaks).
+  const tenfold = tenFoldCV(comps, fitLine);
+  const shuffledComps = comps.map((c, i) => ({ ...c, y: comps[(i * 37 + 11) % comps.length]!.y }));
+  const placeboCoef = ols(shuffledComps.map((c) => [1, c.x]), shuffledComps.map((c) => c.y));
+  const placeboR2 = (() => {
+    if (placeboCoef === null) return 0;
+    const m = shuffledComps.reduce((a, c) => a + c.y, 0) / shuffledComps.length;
+    const tot = shuffledComps.reduce((a, c) => a + (c.y - m) ** 2, 0);
+    const res = shuffledComps.reduce((a, c) => a + (c.y - (placeboCoef[0]! + placeboCoef[1]! * c.x)) ** 2, 0);
+    return tot > 0 ? 1 - res / tot : 0;
+  })();
+  const placeboLoo = looMedianFit(shuffledComps, fitLine);
+
   // Ablation: each term against the same two blind tests. A term is kept only when it
   // improves BOTH tests by more than 0.02 of log error.
   const ablation: AblationRow[] = [];
@@ -743,24 +1153,86 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
   const fullLoo = looMedian(comps, ['growth', 'maturity', 'breadth', 'category']);
   const fullSplit = splitMedian(comps, ['growth', 'maturity', 'breadth', 'category']);
   ablation.push({ term: 'full (all four)', loo_median_log_error: round4(fullLoo), split_median_log_error: round4(fullSplit), kept: base.loo - fullLoo > 0.02 && base.split - fullSplit > 0.02 });
-  const keptTerms = ablation.filter((a) => a.kept && a.term !== 'full (all four)').map((a) => a.term) as TermName[];
+  ablation.push(...challengerRows);
+  const keptTerms = ablation
+    .filter((a) => a.kept && REAL_TERMS.includes(a.term))
+    .map((a) => a.term) as TermName[];
   const finalTerms: TermName[] = keptTerms;
   const finalFit = fitTerms(comps, finalTerms) ?? fullFit;
 
-  // The leave-one-out residuals' 90th percentile, kept as an honest prediction-error stat:
-  // the curve's point predictions are noisy, so a row's interval comes from the bootstrap
-  // below (parameter uncertainty), not from this prediction error.
+  // The leave-one-out residuals' 90th percentile, kept as an honest prediction-error stat.
+  // The row's parameter band does NOT contain this error, so the model also carries the
+  // honest prediction band (see below): expected x exp(+/-h), h from this q90 and the
+  // bootstrap spread. No category has enough comps for its own q90 (the largest has 15,
+  // the rule needs 20), so every row uses the global q90.
   const finalLooErrs: number[] = [];
+  const looErrsByCat = new Map<string, number[]>();
   for (let i = 0; i < comps.length; i++) {
     const rest = comps.filter((_, j) => j !== i);
     const f = fitTerms(rest, finalTerms);
     if (f === null) continue;
-    finalLooErrs.push(Math.abs(comps[i]!.y - f.predict(comps[i]!)));
+    const e = Math.abs(comps[i]!.y - f.predict(comps[i]!));
+    finalLooErrs.push(e);
+    const k = comps[i]!.p.category ?? 'Other';
+    if (!looErrsByCat.has(k)) looErrsByCat.set(k, []);
+    looErrsByCat.get(k)!.push(e);
   }
   const q90 = quantile(finalLooErrs, 0.9);
+  const conformalCoverage = finalLooErrs.length > 0 ? finalLooErrs.filter((e) => e <= q90).length / finalLooErrs.length : 0;
+  const conformalPerCategory: { category: string; n: number; q90: number }[] = [];
+  for (const [k, es] of looErrsByCat) {
+    if (es.length >= CONFORMAL_MIN_N) conformalPerCategory.push({ category: k, n: es.length, q90: round4(quantile(es, 0.9)) });
+  }
 
-  const odds = buildOdds(snapshot);
-  const oddsVal = oddsValidation(snapshot, odds);
+  // Odds: the cohort cells, the tercile challengers, and the challengers' blind tests.
+  const cohort = cohortRows(snapshot);
+  const baseOpts: OddsOpts = { prior: ODDS_PRIOR, buckets: AGE_BUCKETS, tercile: false, useCategory: true, hierarchical: false };
+  const baseOddsLoo = oddsLooBrier(cohort, baseOpts);
+  const baseOddsSplit = oddsSplitBrier(cohort, baseOpts);
+  const oddsAblation: OddsAblationRow[] = [];
+  // The baseline itself, so the table shows what the challengers beat.
+  oddsAblation.push({ term: 'baseline (age × category, prior 5)', loo_brier: round4(baseOddsLoo), split_brier: round4(baseOddsSplit.brier), kept: false });
+  const oddsChallengers: { term: string; loo: number; split: number }[] = [
+    { term: 'prior 3', loo: oddsLooBrier(cohort, { prior: 3, buckets: AGE_BUCKETS, tercile: false, useCategory: true, hierarchical: false }), split: oddsSplitBrier(cohort, { prior: 3, buckets: AGE_BUCKETS, tercile: false, useCategory: true, hierarchical: false }).brier },
+    { term: 'prior 10', loo: oddsLooBrier(cohort, { prior: 10, buckets: AGE_BUCKETS, tercile: false, useCategory: true, hierarchical: false }), split: oddsSplitBrier(cohort, { prior: 10, buckets: AGE_BUCKETS, tercile: false, useCategory: true, hierarchical: false }).brier },
+    { term: 'finer age buckets (0-90d/90-180d)', loo: oddsLooBrier(cohort, { prior: ODDS_PRIOR, buckets: AGE_BUCKETS_FINE, tercile: false, useCategory: true, hierarchical: false }), split: oddsSplitBrier(cohort, { prior: ODDS_PRIOR, buckets: AGE_BUCKETS_FINE, tercile: false, useCategory: true, hierarchical: false }).brier },
+    { term: 'TVL tercile x age', loo: oddsLooBrier(cohort, { prior: ODDS_PRIOR, buckets: AGE_BUCKETS, tercile: true, useCategory: false, hierarchical: false }), split: oddsSplitBrier(cohort, { prior: ODDS_PRIOR, buckets: AGE_BUCKETS, tercile: true, useCategory: false, hierarchical: false }).brier },
+    { term: 'TVL tercile x age x category', loo: oddsLooBrier(cohort, { prior: ODDS_PRIOR, buckets: AGE_BUCKETS, tercile: true, useCategory: true, hierarchical: false }), split: oddsSplitBrier(cohort, { prior: ODDS_PRIOR, buckets: AGE_BUCKETS, tercile: true, useCategory: true, hierarchical: false }).brier },
+    { term: 'hierarchical tercile centre', loo: oddsLooBrier(cohort, { prior: ODDS_PRIOR, buckets: AGE_BUCKETS, tercile: true, useCategory: true, hierarchical: true }), split: oddsSplitBrier(cohort, { prior: ODDS_PRIOR, buckets: AGE_BUCKETS, tercile: true, useCategory: true, hierarchical: true }).brier },
+    { term: 'logistic (age + log TVL)', loo: logitLooBrier(cohort), split: logitSplitBrier(cohort).brier },
+  ];
+  for (const c of oddsChallengers) {
+    // A tercile variant is kept only when it improves BOTH Brier tests; the split gain
+    // must clear 0.01, so a noise-level wiggle alone cannot keep a term. No variant does.
+    const isTercile = c.term.startsWith('TVL tercile') || c.term.startsWith('hierarchical');
+    const kept = isTercile && c.loo < baseOddsLoo && c.split < baseOddsSplit.brier - 0.01;
+    oddsAblation.push({ term: c.term, loo_brier: round4(c.loo), split_brier: round4(c.split), kept });
+  }
+  const tercileKept = oddsAblation.some((a) => a.kept);
+  const odds = buildOdds(snapshot, tercileKept, ODDS_PRIOR, AGE_BUCKETS, AGE_LABELS);
+  const oddsVal = oddsValidation(snapshot, odds, tercileKept);
+
+  // Leave-one-out calibration deciles of the kept odds model: predicted rate vs the
+  // actual launch share in each decile.
+  const calibration: CalibrationRow[] = (() => {
+    const preds = cohort.map((row, i) => {
+      const rest = cohort.filter((_, j) => j !== i);
+      const fn = oddsRateFn(rest, cohort, { prior: ODDS_PRIOR, buckets: AGE_BUCKETS, tercile: tercileKept, useCategory: true, hierarchical: false });
+      return { pred: fn(row), has: row.has };
+    });
+    preds.sort((a, b) => a.pred - b.pred);
+    const out: CalibrationRow[] = [];
+    for (let d = 0; d < 10; d++) {
+      const chunk = preds.slice(Math.floor((d * preds.length) / 10), Math.floor(((d + 1) * preds.length) / 10));
+      if (chunk.length === 0) continue;
+      out.push({
+        pred: round4(chunk.reduce((a, x) => a + x.pred, 0) / chunk.length),
+        actual: round4(chunk.reduce((a, x) => a + x.has, 0) / chunk.length),
+        n: chunk.length,
+      });
+    }
+    return out;
+  })();
 
   // Score every rankable protocol.
   const index = bySlug(snapshot.protocols);
@@ -814,8 +1286,8 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
 
   // Bootstrap ranges: refit the curve on 200 seeded resamples and rescore every row, so
   // each row gets a p10–p90 range for both its expected value and its rank. The interval
-  // is parameter uncertainty — how much the fitted curve moves when the comps change —
-  // and the farm verdict is netted at the low end of that range.
+  // is parameter uncertainty — how much the fitted curve moves when the comps change.
+  // The honest prediction band folds the conformal residual in as well (see below).
   const rankSamples: number[][] = scored.map(() => []);
   const valueSamples: number[][] = scored.map(() => []);
   const r = rng(BOOT_SEED);
@@ -844,6 +1316,21 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
     vals.forEach((v, i) => valueSamples[i]!.push(v));
   }
 
+  // First pass: net economics at the wage bar, to decide the operative FARM threshold.
+  const netOf = (s: (typeof scored)[number], lo: number): ReturnType<typeof netEconomics> =>
+    netEconomics(s.p, s.age, lo, s.expected, DROP_SHARE);
+  const prelim = scored.map((s, i) => {
+    const values = valueSamples[i]!;
+    const lo = Math.max(1, Math.round(values.length > 0 ? quantile(values, 0.1) : s.expected * 0.5));
+    return { s, lo, econ: netOf(s, lo) };
+  });
+  const farmAtWage = prelim.filter((x) => x.econ.netPerHourLow >= FARM_WAGE_THRESHOLD && x.econ.gasTotal <= x.econ.capital / 2).length;
+  const farmThreshold = farmAtWage >= 3 ? FARM_WAGE_THRESHOLD : FARM_THRESHOLD_FALLBACK;
+  const farmThresholdNote =
+    farmThreshold === FARM_WAGE_THRESHOLD
+      ? `FARM when net $/h reaches $${FARM_WAGE_THRESHOLD} at the low end and gas stays under half the capital (${farmAtWage} rows clear it).`
+      : `The $${FARM_WAGE_THRESHOLD}/h wage bar left ${farmAtWage} FARM rows, so the FARM line is break-even $0/h net at the low end, stated here — the counts are an outcome, not a target.`;
+
   const board: BoardRow[] = scored.map((s, i) => {
     const samples = rankSamples[i]!;
     const rankLow = samples.length > 0 ? quantile(samples, 0.1) : i + 1;
@@ -852,7 +1339,21 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
     const values = valueSamples[i]!;
     const lo = Math.max(1, Math.round(values.length > 0 ? quantile(values, 0.1) : s.expected * 0.5));
     const hi = Math.max(lo, Math.round(values.length > 0 ? quantile(values, 0.9) : s.expected * 2));
-    const econ = farmEconomics(s.p, s.age, s.expected, lo);
+    // Honest prediction band: bootstrap spread (log sd from the p10-p90 band) combined
+    // in quadrature with the conformal residual q90. It is far wider than the parameter
+    // band because the curve's point predictions are noisy (typical error 3.4x).
+    const bootSd = (Math.log(hi) - Math.log(lo)) / (2 * 1.2816);
+    const h = Math.sqrt(bootSd * bootSd + q90 * q90);
+    const predLow = Math.max(1, Math.round(s.expected * Math.exp(-h)));
+    const predHigh = Math.max(predLow, Math.round(s.expected * Math.exp(h)));
+    const econ = netEconomics(s.p, s.age, lo, s.expected, DROP_SHARE);
+    // Verdict, netted at the low end of the parameter band: FARM when net $/h reaches
+    // the operative threshold and gas stays under half the capital; THIN when the row
+    // breaks even on its point estimate but not at the low end; SKIP otherwise.
+    let verdict: 'FARM' | 'THIN' | 'SKIP' = 'SKIP';
+    if (econ.netPerHourLow >= farmThreshold && econ.gasTotal <= econ.capital / 2) verdict = 'FARM';
+    else if (econ.netPerHourPoint >= 0) verdict = 'THIN';
+    const minDeposit = Math.round(minDepositFor(s.p, lo, DROP_SHARE, farmThreshold, econ.hours, econ.gasTotal));
     return {
       rank: i + 1,
       slug: s.p.slug,
@@ -868,11 +1369,15 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
       launch_odds: round4(s.odd.rate),
       interval_low_usd: lo,
       interval_high_usd: hi,
+      pred_low_usd: predLow,
+      pred_high_usd: predHigh,
       rank_low: Math.max(1, Math.round(rankLow)),
       rank_high: Math.min(scored.length, Math.round(rankHigh)),
-      verdict: econ.verdict,
-      value_per_hour_usd: Math.round((s.expected / Math.max(0.01, econ.hours)) * 100) / 100,
-      value_per_dollar: Math.round((s.expected / Math.max(0.01, econ.cost)) * 100) / 100,
+      verdict,
+      net_per_hour_usd: Math.round(econ.netPerHourLow * 100) / 100,
+      net_per_hour_point_usd: Math.round(econ.netPerHourPoint * 100) / 100,
+      breakeven_capture_pct: Math.round(econ.breakevenCapturePct * 1e4) / 1e4,
+      min_deposit_farm_usd: minDeposit,
       farm_cost_usd: Math.round(econ.cost * 100) / 100,
       farm_hours: econ.hours,
       capital_usd: econ.capital,
@@ -883,10 +1388,10 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
         maturity_multiplier: round4(s.maturityMult),
         breadth_multiplier: round4(s.breadthMult),
         category_effect: round4(s.catEffect),
-        odds_bucket: s.odd.bucket,
+        odds_bucket: tercileKept ? `${s.odd.bucket} · ${s.odd.tercile}` : s.odd.bucket,
         odds_cell_n: s.odd.n,
       },
-      farm_steps: farmSteps(s.p, s.age).map(stepText),
+      farm_steps: farmSteps(s.p, s.age, { slope: finalFit.coef[1]!, kinName: s.kin?.name ?? '' }).map(stepText),
     };
   });
 
@@ -936,8 +1441,20 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
     median_loo_median_log_error: round4(medianLoo),
     quad_loo_median_log_error: round4(quadLoo),
     quad_split_median_log_error: round4(quadSplit),
+    tenfold_cv_median_log_error: round4(tenfold),
+    placebo_r2: round4(placeboR2),
+    placebo_loo_median_log_error: round4(placeboLoo),
     per_category: perCategory,
   };
+  const tercileTable = tercileKept
+    ? AGE_LABELS.flatMap((label, b) =>
+        ['small TVL', 'mid TVL', 'large TVL'].map((tercile, t) => {
+          const inCell = cohort.filter((r) => bucketIndex(r.age, AGE_BUCKETS) === b && r.tercile === t);
+          const tk = inCell.filter((r) => r.has === 1).length;
+          return { bucket: label, tercile, n: inCell.length, tokens: tk, rate: round4(inCell.length > 0 ? tk / inCell.length : odds.globalRate) };
+        }),
+      )
+    : [];
   const model: ModelReport = {
     version: MODEL_VERSION,
     curve,
@@ -949,21 +1466,36 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
       buckets: odds.buckets.map((b) => ({ label: b.label, n: b.n, tokens: b.tokens, rate: round4(b.rate) })),
       cells: AGE_LABELS.flatMap((label, b) => {
         const cats = [...new Set(snapshot.protocols.map((p) => p.category ?? 'Other'))].sort();
-        return cats
-          .map((cat) => {
-            const cell = odds.cellRate(b, cat);
-            return cell.n > 0 ? { bucket: label, category: cat, n: cell.n, rate: round4(cell.rate) } : null;
-          })
-          .filter((c): c is { bucket: string; category: string; n: number; rate: number } => c !== null);
+        const terciles = tercileKept ? [0, 1, 2] : [null];
+        return terciles.flatMap((t) =>
+          cats
+            .map((cat) => {
+              const cell = odds.cellRate(b, t, cat);
+              return cell.n > 0
+                ? { bucket: label, tercile: t === null ? null : ['small TVL', 'mid TVL', 'large TVL'][t]!, category: cat, n: cell.n, rate: round4(cell.rate) }
+                : null;
+            })
+            .filter((c): c is { bucket: string; tercile: string | null; category: string; n: number; rate: number } => c !== null),
+        );
       }),
+      tercile_kept: tercileKept,
+      tercile_cuts_usd: odds.tercileCuts,
+      tercile_table: tercileTable,
       loo_brier: round4(oddsVal.looBrier),
       base_brier: round4(oddsVal.baseBrier),
       loo_log_loss: round4(oddsVal.looLogLoss),
       base_log_loss: round4(oddsVal.baseLogLoss),
       split_brier: round4(oddsVal.splitBrier),
       split_base_brier: round4(oddsVal.splitBaseBrier),
+      calibration,
+      ablation: oddsAblation,
     },
     conformal_q90_log: round4(q90),
+    conformal_coverage: round4(conformalCoverage),
+    conformal_per_category: conformalPerCategory,
+    drop_share: DROP_SHARE,
+    farm_threshold_usd_per_hour: farmThreshold,
+    farm_threshold_note: farmThresholdNote,
     audit: {
       ranked: board.length,
       traded,
@@ -1054,7 +1586,7 @@ function looMedianCategoryMedian(comps: Comp[]): number {
 }
 
 /** The time split's absolute log errors for a term set. */
-function splitErrors(comps: Comp[], terms: TermSet): number[] {
+function splitErrors(comps: Comp[], terms: TermName[]): number[] {
   const dated = comps.filter((c) => c.age !== null).sort((a, b) => (b.age ?? 0) - (a.age ?? 0));
   if (dated.length < 20) return [];
   const half = Math.floor(dated.length / 2);
